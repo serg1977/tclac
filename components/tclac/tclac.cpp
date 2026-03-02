@@ -1,10 +1,12 @@
 /**
-* Create by Miguel Ángel López on 20/07/19
-* and modify by xaxexa
-* Refactoring & component making:
-* Соловей с паяльником 15.03.2024
-* Доработки и логи для AUTO setpoint: 2025–2026 (Grok-assisted)
-**/
+ * Create by Miguel Ángel López on 20/07/19
+ * and modify by xaxexa
+ * Refactoring & component making:
+ * Соловей с паяльником 15.03.2024
+ *
+ * 2025–2026: используем CLIMATE_MODE_HEAT_COOL вместо AUTO,
+ * чтобы в HA показывался ползунок температуры
+ */
 #include "esphome.h"
 #include "esphome/core/defines.h"
 #include "tclac.h"
@@ -23,7 +25,7 @@ ClimateTraits tclacClimate::traits() {
   traits.set_supported_swing_modes(this->supported_swing_modes_);
 
   traits.add_supported_mode(climate::CLIMATE_MODE_OFF);
-  traits.add_supported_mode(climate::CLIMATE_MODE_AUTO);
+  traits.add_supported_mode(climate::CLIMATE_MODE_HEAT_COOL);   // ← вместо AUTO
   traits.add_supported_fan_mode(climate::CLIMATE_FAN_AUTO);
   traits.add_supported_swing_mode(climate::CLIMATE_SWING_OFF);
   traits.add_supported_preset(ClimatePreset::CLIMATE_PRESET_NONE);
@@ -52,7 +54,7 @@ void tclacClimate::loop() {
     dataRX[0] = esphome::uart::UARTDevice::read();
     if (dataRX[0] != 0xBB) {
       ESP_LOGD("TCL", "Wrong byte");
-      dataShow(0,0);
+      dataShow(0, 0);
       return;
     }
     delay(5);
@@ -86,11 +88,11 @@ void tclacClimate::update() {
 }
 
 void tclacClimate::readData() {
-  current_temperature = float(((dataRX[17] << 8) | dataRX[18]) / 374 - 32) / 1.8;
+  current_temperature = float(((dataRX[17] << 8) | dataRX[18]) / 374.0 - 32) / 1.8;
   target_temperature = (dataRX[FAN_SPEED_POS] & SET_TEMP_MASK) + 16;
 
-  ESP_LOGD("TCL", "Reported target from AC: %.0f °C (you requested: %d °C)",
-           target_temperature, 31 - target_temperature_set);
+  ESP_LOGD("TCL", "Current: %.1f °C   Target from AC: %.0f °C   (we sent: %d)",
+           current_temperature, target_temperature, 31 - target_temperature_set);
 
   if (dataRX[MODE_POS] & (1 << 4)) {
     uint8_t modeswitch = MODE_MASK & dataRX[MODE_POS];
@@ -98,12 +100,23 @@ void tclacClimate::readData() {
     uint8_t swingmodeswitch = SWING_MODE_MASK & dataRX[SWING_POS];
 
     switch (modeswitch) {
-      case MODE_AUTO: mode = climate::CLIMATE_MODE_AUTO; break;
-      case MODE_COOL: mode = climate::CLIMATE_MODE_COOL; break;
-      case MODE_DRY:  mode = climate::CLIMATE_MODE_DRY;  break;
-      case MODE_FAN_ONLY: mode = climate::CLIMATE_MODE_FAN_ONLY; break;
-      case MODE_HEAT: mode = climate::CLIMATE_MODE_HEAT; break;
-      default: mode = climate::CLIMATE_MODE_AUTO;
+      case MODE_AUTO:
+        mode = climate::CLIMATE_MODE_HEAT_COOL;   // ← важно!
+        break;
+      case MODE_COOL:
+        mode = climate::CLIMATE_MODE_COOL;
+        break;
+      case MODE_DRY:
+        mode = climate::CLIMATE_MODE_DRY;
+        break;
+      case MODE_FAN_ONLY:
+        mode = climate::CLIMATE_MODE_FAN_ONLY;
+        break;
+      case MODE_HEAT:
+        mode = climate::CLIMATE_MODE_HEAT;
+        break;
+      default:
+        mode = climate::CLIMATE_MODE_HEAT_COOL;
     }
 
     if (dataRX[FAN_QUIET_POS] & FAN_QUIET) {
@@ -118,7 +131,7 @@ void tclacClimate::readData() {
         case FAN_MEDIUM: fan_mode = climate::CLIMATE_FAN_MEDIUM; break;
         case FAN_HIGH:   fan_mode = climate::CLIMATE_FAN_HIGH;   break;
         case FAN_FOCUS:  fan_mode = climate::CLIMATE_FAN_FOCUS;  break;
-        default: fan_mode = climate::CLIMATE_FAN_AUTO;
+        default:         fan_mode = climate::CLIMATE_FAN_AUTO;
       }
     }
 
@@ -130,9 +143,13 @@ void tclacClimate::readData() {
     }
 
     preset = ClimatePreset::CLIMATE_PRESET_NONE;
-    if (dataRX[7] & (1 << 6)) preset = ClimatePreset::CLIMATE_PRESET_ECO;
-    else if (dataRX[9] & (1 << 2)) preset = ClimatePreset::CLIMATE_PRESET_COMFORT;
-    else if (dataRX[19] & (1 << 0)) preset = ClimatePreset::CLIMATE_PRESET_SLEEP;
+    if (dataRX[7] & (1 << 6)) {
+      preset = ClimatePreset::CLIMATE_PRESET_ECO;
+    } else if (dataRX[9] & (1 << 2)) {
+      preset = ClimatePreset::CLIMATE_PRESET_COMFORT;
+    } else if (dataRX[19] & (1 << 0)) {
+      preset = ClimatePreset::CLIMATE_PRESET_SLEEP;
+    }
   } else {
     mode = climate::CLIMATE_MODE_OFF;
     swing_mode = climate::CLIMATE_SWING_OFF;
@@ -146,6 +163,7 @@ void tclacClimate::readData() {
 void tclacClimate::control(const ClimateCall &call) {
   if (call.get_mode().has_value()) {
     switch_climate_mode = call.get_mode().value();
+    ESP_LOGD("TCL", "Mode from HA: %d", switch_climate_mode);
   } else {
     switch_climate_mode = mode;
   }
@@ -172,10 +190,10 @@ void tclacClimate::control(const ClimateCall &call) {
     int requested = (int)call.get_target_temperature().value();
     target_temperature_set = 31 - requested;
 
-    if (switch_climate_mode == climate::CLIMATE_MODE_AUTO) {
-      ESP_LOGI("TCL", "AUTO mode → target temperature изменена на %d °C (AC реагирует на setpoint)", requested);
+    if (switch_climate_mode == climate::CLIMATE_MODE_HEAT_COOL) {
+      ESP_LOGI("TCL", "AUTO (heat_cool) → target изменён на %d °C", requested);
     } else {
-      ESP_LOGD("TCL", "Target temperature установлена на %d °C", requested);
+      ESP_LOGD("TCL", "Target temperature: %d °C", requested);
     }
   } else {
     target_temperature_set = 31 - (int)target_temperature;
@@ -187,14 +205,14 @@ void tclacClimate::control(const ClimateCall &call) {
 }
 
 void tclacClimate::takeControl() {
-  dataTX[7]  = 0b00000000;
-  dataTX[8]  = 0b00000000;
-  dataTX[9]  = 0b00000000;
-  dataTX[10] = 0b00000000;
-  dataTX[11] = 0b00000000;
-  dataTX[19] = 0b00000000;
-  dataTX[32] = 0b00000000;
-  dataTX[33] = 0b00000000;
+  dataTX[7] = 0;
+  dataTX[8] = 0;
+  dataTX[9] = 0;
+  dataTX[10] = 0;
+  dataTX[11] = 0;
+  dataTX[19] = 0;
+  dataTX[32] = 0;
+  dataTX[33] = 0;
 
   if (!is_call_control) {
     switch_climate_mode = mode;
@@ -204,176 +222,104 @@ void tclacClimate::takeControl() {
     target_temperature_set = 31 - (int)target_temperature;
   }
 
-  if (beeper_status_) dataTX[7] += 0b00100000;
+  // beep
+  if (beeper_status_) dataTX[7] |= 0b00100000;
 
+  // display
   if (display_status_ && switch_climate_mode != climate::CLIMATE_MODE_OFF) {
-    dataTX[7] += 0b01000000;
+    dataTX[7] |= 0b01000000;
   }
 
+  // режим
   switch (switch_climate_mode) {
     case climate::CLIMATE_MODE_OFF:
       break;
-    case climate::CLIMATE_MODE_AUTO:
-      dataTX[7] += 0b00000100;
-      dataTX[8] += 0b00001000;
+    case climate::CLIMATE_MODE_HEAT_COOL:   // ← бывший AUTO
+    case climate::CLIMATE_MODE_AUTO:        // на всякий случай
+      dataTX[7] |= 0b00000100;
+      dataTX[8] |= 0b00001000;
       break;
     case climate::CLIMATE_MODE_COOL:
-      dataTX[7] += 0b00000100;
-      dataTX[8] += 0b00000011;
+      dataTX[7] |= 0b00000100;
+      dataTX[8] |= 0b00000011;
       break;
     case climate::CLIMATE_MODE_DRY:
-      dataTX[7] += 0b00000100;
-      dataTX[8] += 0b00000010;
+      dataTX[7] |= 0b00000100;
+      dataTX[8] |= 0b00000010;
       break;
     case climate::CLIMATE_MODE_FAN_ONLY:
-      dataTX[7] += 0b00000100;
-      dataTX[8] += 0b00000111;
+      dataTX[7] |= 0b00000100;
+      dataTX[8] |= 0b00000111;
       break;
     case climate::CLIMATE_MODE_HEAT:
-      dataTX[7] += 0b00000100;
-      dataTX[8] += 0b00000001;
+      dataTX[7] |= 0b00000100;
+      dataTX[8] |= 0b00000001;
       break;
   }
 
+  // вентилятор
   switch (switch_fan_mode) {
-    case climate::CLIMATE_FAN_AUTO:
-      dataTX[8] += 0b00000000;
-      dataTX[10] += 0b00000000;
-      break;
-    case climate::CLIMATE_FAN_QUIET:
-      dataTX[8] += 0b10000000;
-      dataTX[10] += 0b00000000;
-      break;
-    case climate::CLIMATE_FAN_LOW:
-      dataTX[8] += 0b00000000;
-      dataTX[10] += 0b00000001;
-      break;
-    case climate::CLIMATE_FAN_MIDDLE:
-      dataTX[8] += 0b00000000;
-      dataTX[10] += 0b00000110;
-      break;
-    case climate::CLIMATE_FAN_MEDIUM:
-      dataTX[8] += 0b00000000;
-      dataTX[10] += 0b00000011;
-      break;
-    case climate::CLIMATE_FAN_HIGH:
-      dataTX[8] += 0b00000000;
-      dataTX[10] += 0b00000111;
-      break;
-    case climate::CLIMATE_FAN_FOCUS:
-      dataTX[8] += 0b00000000;
-      dataTX[10] += 0b00000101;
-      break;
-    case climate::CLIMATE_FAN_DIFFUSE:
-      dataTX[8] += 0b01000000;
-      dataTX[10] += 0b00000000;
-      break;
+    case climate::CLIMATE_FAN_AUTO:    dataTX[8] |= 0; dataTX[10] |= 0; break;
+    case climate::CLIMATE_FAN_QUIET:   dataTX[8] |= 0x80; dataTX[10] |= 0; break;
+    case climate::CLIMATE_FAN_LOW:     dataTX[10] |= 1; break;
+    case climate::CLIMATE_FAN_MIDDLE:  dataTX[10] |= 6; break;
+    case climate::CLIMATE_FAN_MEDIUM:  dataTX[10] |= 3; break;
+    case climate::CLIMATE_FAN_HIGH:    dataTX[10] |= 7; break;
+    case climate::CLIMATE_FAN_FOCUS:   dataTX[10] |= 5; break;
+    case climate::CLIMATE_FAN_DIFFUSE: dataTX[8] |= 0x40; break;
   }
 
+  // качание
   switch (switch_swing_mode) {
-    case climate::CLIMATE_SWING_OFF:
-      dataTX[10] += 0b00000000;
-      dataTX[11] += 0b00000000;
-      break;
-    case climate::CLIMATE_SWING_VERTICAL:
-      dataTX[10] += 0b00111000;
-      dataTX[11] += 0b00000000;
-      break;
-    case climate::CLIMATE_SWING_HORIZONTAL:
-      dataTX[10] += 0b00000000;
-      dataTX[11] += 0b00001000;
-      break;
-    case climate::CLIMATE_SWING_BOTH:
-      dataTX[10] += 0b00111000;
-      dataTX[11] += 0b00001000;
-      break;
+    case climate::CLIMATE_SWING_OFF:       dataTX[10] &= ~0b00111000; dataTX[11] &= ~0b00001000; break;
+    case climate::CLIMATE_SWING_VERTICAL:  dataTX[10] |= 0b00111000; break;
+    case climate::CLIMATE_SWING_HORIZONTAL:dataTX[11] |= 0b00001000; break;
+    case climate::CLIMATE_SWING_BOTH:      dataTX[10] |= 0b00111000; dataTX[11] |= 0b00001000; break;
   }
 
+  // пресеты
   switch (switch_preset) {
-    case ClimatePreset::CLIMATE_PRESET_NONE:
-      break;
-    case ClimatePreset::CLIMATE_PRESET_ECO:
-      dataTX[7] += 0b10000000;
-      break;
-    case ClimatePreset::CLIMATE_PRESET_SLEEP:
-      dataTX[19] += 0b00000001;
-      break;
-    case ClimatePreset::CLIMATE_PRESET_COMFORT:
-      dataTX[8] += 0b00010000;
-      break;
+    case ClimatePreset::CLIMATE_PRESET_ECO:     dataTX[7] |= 0x80; break;
+    case ClimatePreset::CLIMATE_PRESET_SLEEP:   dataTX[19] |= 1;   break;
+    case ClimatePreset::CLIMATE_PRESET_COMFORT: dataTX[8] |= 0x10; break;
   }
 
+  // вертикальное качание / фиксация
   switch (vertical_swing_direction_) {
-    case VerticalSwingDirection::UP_DOWN:
-      dataTX[32] += 0b00001000;
-      break;
-    case VerticalSwingDirection::UPSIDE:
-      dataTX[32] += 0b00010000;
-      break;
-    case VerticalSwingDirection::DOWNSIDE:
-      dataTX[32] += 0b00011000;
-      break;
+    case VerticalSwingDirection::UP_DOWN:  dataTX[32] |= 0b00001000; break;
+    case VerticalSwingDirection::UPSIDE:   dataTX[32] |= 0b00010000; break;
+    case VerticalSwingDirection::DOWNSIDE: dataTX[32] |= 0b00011000; break;
   }
 
   switch (vertical_direction_) {
-    case AirflowVerticalDirection::LAST:
-      dataTX[32] += 0b00000000;
-      break;
-    case AirflowVerticalDirection::MAX_UP:
-      dataTX[32] += 0b00000001;
-      break;
-    case AirflowVerticalDirection::UP:
-      dataTX[32] += 0b00000010;
-      break;
-    case AirflowVerticalDirection::CENTER:
-      dataTX[32] += 0b00000011;
-      break;
-    case AirflowVerticalDirection::DOWN:
-      dataTX[32] += 0b00000100;
-      break;
-    case AirflowVerticalDirection::MAX_DOWN:
-      dataTX[32] += 0b00000101;
-      break;
+    case AirflowVerticalDirection::LAST:     dataTX[32] |= 0;      break;
+    case AirflowVerticalDirection::MAX_UP:   dataTX[32] |= 0b00000001; break;
+    case AirflowVerticalDirection::UP:       dataTX[32] |= 0b00000010; break;
+    case AirflowVerticalDirection::CENTER:   dataTX[32] |= 0b00000011; break;
+    case AirflowVerticalDirection::DOWN:     dataTX[32] |= 0b00000100; break;
+    case AirflowVerticalDirection::MAX_DOWN: dataTX[32] |= 0b00000101; break;
   }
 
+  // горизонтальное качание / фиксация
   switch (horizontal_swing_direction_) {
-    case HorizontalSwingDirection::LEFT_RIGHT:
-      dataTX[33] += 0b00001000;
-      break;
-    case HorizontalSwingDirection::LEFTSIDE:
-      dataTX[33] += 0b00010000;
-      break;
-    case HorizontalSwingDirection::CENTER:
-      dataTX[33] += 0b00011000;
-      break;
-    case HorizontalSwingDirection::RIGHTSIDE:
-      dataTX[33] += 0b00100000;
-      break;
+    case HorizontalSwingDirection::LEFT_RIGHT: dataTX[33] |= 0b00001000; break;
+    case HorizontalSwingDirection::LEFTSIDE:   dataTX[33] |= 0b00010000; break;
+    case HorizontalSwingDirection::CENTER:     dataTX[33] |= 0b00011000; break;
+    case HorizontalSwingDirection::RIGHTSIDE:  dataTX[33] |= 0b00100000; break;
   }
 
   switch (horizontal_direction_) {
-    case AirflowHorizontalDirection::LAST:
-      dataTX[33] += 0b00000000;
-      break;
-    case AirflowHorizontalDirection::MAX_LEFT:
-      dataTX[33] += 0b00000001;
-      break;
-    case AirflowHorizontalDirection::LEFT:
-      dataTX[33] += 0b00000010;
-      break;
-    case AirflowHorizontalDirection::CENTER:
-      dataTX[33] += 0b00000011;
-      break;
-    case AirflowHorizontalDirection::RIGHT:
-      dataTX[33] += 0b00000100;
-      break;
-    case AirflowHorizontalDirection::MAX_RIGHT:
-      dataTX[33] += 0b00000101;
-      break;
+    case AirflowHorizontalDirection::LAST:      dataTX[33] |= 0;      break;
+    case AirflowHorizontalDirection::MAX_LEFT:  dataTX[33] |= 0b00000001; break;
+    case AirflowHorizontalDirection::LEFT:      dataTX[33] |= 0b00000010; break;
+    case AirflowHorizontalDirection::CENTER:    dataTX[33] |= 0b00000011; break;
+    case AirflowHorizontalDirection::RIGHT:     dataTX[33] |= 0b00000100; break;
+    case AirflowHorizontalDirection::MAX_RIGHT: dataTX[33] |= 0b00000101; break;
   }
 
   dataTX[9] = target_temperature_set;
 
+  // заголовок
   dataTX[0] = 0xBB;
   dataTX[1] = 0x00;
   dataTX[2] = 0x01;
@@ -381,6 +327,7 @@ void tclacClimate::takeControl() {
   dataTX[4] = 0x20;
   dataTX[5] = 0x03;
   dataTX[6] = 0x01;
+
   dataTX[12] = 0x00;
   dataTX[13] = 0x01;
   dataTX[14] = 0x00;
@@ -402,6 +349,7 @@ void tclacClimate::takeControl() {
   dataTX[34] = 0x00;
   dataTX[35] = 0x00;
   dataTX[36] = 0x00;
+
   dataTX[37] = getChecksum(dataTX, sizeof(dataTX));
 
   sendData(dataTX, sizeof(dataTX));
@@ -409,20 +357,26 @@ void tclacClimate::takeControl() {
   is_call_control = false;
 }
 
+// ────────────────────────────────────────────────────────────────────────────────
+// Остальные методы остаются без изменений
+// ────────────────────────────────────────────────────────────────────────────────
+
 void tclacClimate::sendData(byte *message, byte size) {
   dataShow(1, 1);
   this->esphome::uart::UARTDevice::write_array(message, size);
-  ESP_LOGD("TCL", "Message to TCL sent...");
+  ESP_LOGD("TCL", "Message sent (%d bytes)", size);
   dataShow(1, 0);
 }
 
 String tclacClimate::getHex(byte *message, byte size) {
-  String raw;
+  String s;
   for (int i = 0; i < size; i++) {
-    raw += String(message[i], HEX) + " ";
+    if (message[i] < 16) s += "0";
+    s += String(message[i], HEX);
+    s += " ";
   }
-  raw.toUpperCase();
-  return raw;
+  s.toUpperCase();
+  return s;
 }
 
 byte tclacClimate::getChecksum(const byte *message, size_t size) {
@@ -434,32 +388,20 @@ byte tclacClimate::getChecksum(const byte *message, size_t size) {
 }
 
 void tclacClimate::dataShow(bool flow, bool shine) {
-  if (module_display_status_) {
-    if (flow == 0) {
-      if (shine == 1) {
+  if (!module_display_status_) return;
+
+  if (flow == 0) {
 #ifdef CONF_RX_LED
-        this->rx_led_pin_->digital_write(true);
+    this->rx_led_pin_->digital_write(shine);
 #endif
-      } else {
-#ifdef CONF_RX_LED
-        this->rx_led_pin_->digital_write(false);
-#endif
-      }
-    }
-    if (flow == 1) {
-      if (shine == 1) {
+  } else {
 #ifdef CONF_TX_LED
-        this->tx_led_pin_->digital_write(true);
+    this->tx_led_pin_->digital_write(shine);
 #endif
-      } else {
-#ifdef CONF_TX_LED
-        this->tx_led_pin_->digital_write(false);
-#endif
-      }
-    }
   }
 }
 
+// все set_ методы без изменений
 void tclacClimate::set_beeper_state(bool state) {
   this->beeper_status_ = state;
   if (force_mode_status_ && allow_take_control) takeControl();
@@ -475,56 +417,39 @@ void tclacClimate::set_force_mode_state(bool state) {
 }
 
 #ifdef CONF_RX_LED
-void tclacClimate::set_rx_led_pin(GPIOPin *rx_led_pin) {
-  this->rx_led_pin_ = rx_led_pin;
-}
+void tclacClimate::set_rx_led_pin(GPIOPin *p) { this->rx_led_pin_ = p; }
 #endif
 
 #ifdef CONF_TX_LED
-void tclacClimate::set_tx_led_pin(GPIOPin *tx_led_pin) {
-  this->tx_led_pin_ = tx_led_pin;
-}
+void tclacClimate::set_tx_led_pin(GPIOPin *p) { this->tx_led_pin_ = p; }
 #endif
 
-void tclacClimate::set_module_display_state(bool state) {
-  this->module_display_status_ = state;
-}
+void tclacClimate::set_module_display_state(bool state) { this->module_display_status_ = state; }
 
-void tclacClimate::set_vertical_airflow(AirflowVerticalDirection direction) {
-  this->vertical_direction_ = direction;
+void tclacClimate::set_vertical_airflow(AirflowVerticalDirection d) {
+  this->vertical_direction_ = d;
   if (force_mode_status_ && allow_take_control) takeControl();
 }
 
-void tclacClimate::set_horizontal_airflow(AirflowHorizontalDirection direction) {
-  this->horizontal_direction_ = direction;
+void tclacClimate::set_horizontal_airflow(AirflowHorizontalDirection d) {
+  this->horizontal_direction_ = d;
   if (force_mode_status_ && allow_take_control) takeControl();
 }
 
-void tclacClimate::set_vertical_swing_direction(VerticalSwingDirection direction) {
-  this->vertical_swing_direction_ = direction;
+void tclacClimate::set_vertical_swing_direction(VerticalSwingDirection d) {
+  this->vertical_swing_direction_ = d;
   if (force_mode_status_ && allow_take_control) takeControl();
 }
 
-void tclacClimate::set_horizontal_swing_direction(HorizontalSwingDirection direction) {
-  horizontal_swing_direction_ = direction;
+void tclacClimate::set_horizontal_swing_direction(HorizontalSwingDirection d) {
+  this->horizontal_swing_direction_ = d;
   if (force_mode_status_ && allow_take_control) takeControl();
 }
 
-void tclacClimate::set_supported_modes(climate::ClimateModeMask modes) {
-  this->supported_modes_ = modes;
-}
-
-void tclacClimate::set_supported_fan_modes(climate::ClimateFanModeMask modes) {
-  this->supported_fan_modes_ = modes;
-}
-
-void tclacClimate::set_supported_swing_modes(climate::ClimateSwingModeMask modes) {
-  this->supported_swing_modes_ = modes;
-}
-
-void tclacClimate::set_supported_presets(climate::ClimatePresetMask presets) {
-  this->supported_presets_ = presets;
-}
+void tclacClimate::set_supported_modes(climate::ClimateModeMask m) { this->supported_modes_ = m; }
+void tclacClimate::set_supported_fan_modes(climate::ClimateFanModeMask m) { this->supported_fan_modes_ = m; }
+void tclacClimate::set_supported_swing_modes(climate::ClimateSwingModeMask m) { this->supported_swing_modes_ = m; }
+void tclacClimate::set_supported_presets(climate::ClimatePresetMask p) { this->supported_presets_ = p; }
 
 }  // namespace tclac
 }  // namespace esphome
